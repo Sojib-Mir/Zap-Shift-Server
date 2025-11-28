@@ -26,18 +26,23 @@ const generateTrackingId = () => {
 app.use(cors());
 app.use(express.json());
 
-const verifyFBToken = (req, res, next) => {
-  console.log(
-    "Headers In The MiddleWare==========>",
-    req.headers.authorization
-  );
-
+// Verify token
+const verifyFBToken = async (req, res, next) => {
   const token = req.headers.authorization;
+
   if (!token) {
-    return res.status(401).send({ message: "Unauthorized Token" });
+    return res.status(401).send({ message: "unauthorized access" });
   }
 
-  next();
+  try {
+    const idToken = token.split(" ")[1];
+    const decoded = await admin.auth().verifyIdToken(idToken);
+    // console.log("decoded in the token", decoded);
+    req.decoded_email = decoded.email;
+    next();
+  } catch (err) {
+    return res.status(401).send({ message: "unauthorized access" });
+  }
 };
 
 const uri = `mongodb+srv://${process.env.DB_USER}:${process.env.DB_PASS}@cluster0.u7ffvmg.mongodb.net/?appName=Cluster0`;
@@ -61,9 +66,37 @@ async function run() {
     const paymentsCollection = db.collection("payments");
     const ridersCollection = db.collection("riders");
 
-    // user related apis
+    // middleware admin before allowing admin activity
+    // must be use after verifyFBToken middleware
+    const verifyAdmin = async (req, res, next) => {
+      const email = req.decoded_email;
+      const query = { email };
+      const user = await usersCollection.findOne(query);
+      if (!user || user.role !== "admin") {
+        return res.status(403).send({ message: "forbidden access" });
+      }
+
+      next();
+    };
+
+    // users related apis
     app.get("/users", verifyFBToken, async (req, res) => {
-      const result = await usersCollection.find().toArray();
+      const searchText = req.query.searchText;
+      const query = {};
+
+      if (searchText) {
+        // query.displayName = { $regex: searchText, $options: "i" };
+        query.$or = [
+          { displayName: { $regex: searchText, $options: "i" } },
+          { email: { $regex: searchText, $options: "i" } },
+        ];
+      }
+
+      const result = await usersCollection
+        .find(query)
+        .sort({ createdAt: -1 })
+        .limit(5)
+        .toArray();
       res.send(result);
     });
 
@@ -92,29 +125,51 @@ async function run() {
       res.send(result);
     });
 
-    app.patch("/users/:id", async (req, res) => {
-      const id = req.params.id;
-      const roleInfo = req.body;
-      const objectId = { _id: new ObjectId(id) };
-      const updatedDoc = {
-        $set: {
-          role: roleInfo.role,
-        },
-      };
-      const result = await usersCollection.updateOne(objectId, updatedDoc);
-      res.send(result);
-    });
+    app.patch(
+      "/users/:id/role",
+      verifyFBToken,
+      verifyAdmin,
+      async (req, res) => {
+        const id = req.params.id;
+        const roleInfo = req.body;
+        const objectId = { _id: new ObjectId(id) };
+        const updatedDoc = {
+          $set: {
+            role: roleInfo.role,
+          },
+        };
+        const result = await usersCollection.updateOne(objectId, updatedDoc);
+        res.send(result);
+      }
+    );
 
-    // parcel api
+    // parcel related apis
     app.get("/parcels", async (req, res) => {
       const query = {};
 
-      const { email } = req.query;
+      const { email, deliveryStatus } = req.query;
       if (email) {
         query.senderEmail = email;
       }
+
+      if (deliveryStatus) {
+        query.deliveryStatus = deliveryStatus;
+      }
       const options = { sort: { createdAt: -1 } };
       const result = await parcelsCollection.find(query, options).toArray();
+      res.send(result);
+    });
+
+    app.get("/parcels/rider", async (req, res) => {
+      const { riderEmail, deliveryStatus } = req.query;
+      const query = {};
+      if (riderEmail) {
+        query.riderEmail = riderEmail;
+      }
+      if (deliveryStatus) {
+        query.deliveryStatus = deliveryStatus;
+      }
+      const result = await parcelsCollection.find(query).toArray();
       res.send(result);
     });
 
@@ -139,6 +194,36 @@ async function run() {
 
       const result = await parcelsCollection.deleteOne(objectId);
       res.send(result);
+    });
+
+    app.patch("/parcels/:id", async (req, res) => {
+      const { riderId, riderName, riderEmail } = req.body;
+      const id = req.params.id;
+      const objectId = { _id: new ObjectId(id) };
+      const updateDoc = {
+        $set: {
+          deliveryStatus: "driver_assigned",
+          riderId: riderId,
+          riderName: riderName,
+          riderEmail: riderEmail,
+        },
+      };
+
+      const result = await parcelsCollection.updateOne(objectId, updateDoc);
+
+      // update rider information
+      const riderOjbectId = { _id: new ObjectId(riderId) };
+      const riderUpdateDoc = {
+        $set: {
+          workStatus: "in_delivery",
+        },
+      };
+      const riderResult = await ridersCollection.updateOne(
+        riderOjbectId,
+        riderUpdateDoc
+      );
+
+      res.send(riderResult);
     });
 
     // Payment releted apis
@@ -197,7 +282,7 @@ async function run() {
         cancel_url: `${process.env.SITE_DOMAIN}/dashboard/payment-cancel`,
       });
 
-      console.log(session);
+      // console.log(session);
       res.send({ url: session.url });
     });
 
@@ -210,7 +295,7 @@ async function run() {
       const query = { transactionId: transactionId };
 
       const paymentExsit = await paymentsCollection.findOne(query);
-      console.log(paymentExsit);
+      // console.log(paymentExsit);
 
       const trackingId = generateTrackingId();
 
@@ -227,6 +312,7 @@ async function run() {
         const update = {
           $set: {
             paymentStatus: "paid",
+            deliveryStatus: "pending-pickup",
             trackingId: trackingId,
           },
         };
@@ -265,7 +351,7 @@ async function run() {
       const email = req.query.email;
       const query = {};
 
-      console.log("Headers ==========>", req.headers);
+      // console.log("Headers ==========>", req.headers);
 
       if (email) {
         query.customerEmail = email;
@@ -279,10 +365,23 @@ async function run() {
 
     // Rider related apis
     app.get("/riders", async (req, res) => {
+      const { status, district, workStatus } = req.query;
       const query = {};
-      if (req.query.status) {
-        query.status = req.query.status;
+
+      if (status) {
+        query.status = status;
       }
+
+      if (district) {
+        query.district = district;
+      }
+
+      if (workStatus) {
+        query.workStatus = workStatus;
+      }
+
+      console.log(query);
+
       const result = await ridersCollection.find(query).toArray();
       res.send(result);
     });
@@ -296,13 +395,14 @@ async function run() {
       res.send(result);
     });
 
-    app.patch("/riders/:id", verifyFBToken, async (req, res) => {
+    app.patch("/riders/:id", verifyFBToken, verifyAdmin, async (req, res) => {
       const status = req.body.status;
       const id = req.params.id;
       const objectId = { _id: new ObjectId(id) };
       const updatedInfo = {
         $set: {
           status: status,
+          workStatus: "available",
         },
       };
       const result = await ridersCollection.updateOne(objectId, updatedInfo);
